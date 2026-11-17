@@ -48,6 +48,7 @@ The terminal output is coloured. Desktop and phone notifications use the matchin
 | `--months N` | look-ahead window in months (default 2) |
 | `--service ID` | watch a different service (default `144512`) |
 | `--list-services` | print all bookable services and their ids |
+| `-v`, `--verbose` | print a line for every check (by default only the first check, every 30th check, hits and errors are logged) |
 | `--once` | check once and exit |
 | `--test` | send a test notification and exit |
 | `--no-sleep-lock` | don't prevent the computer from sleeping |
@@ -63,6 +64,18 @@ The terminal output is coloured. Desktop and phone notifications use the matchin
    - Waits with a little random jitter between checks.
    - Backs off when the network fails, and warns you after 5 failed checks in a row.
    - Prevents sleep while running (`caffeinate` on macOS, a power request on Windows).
+
+## What gets logged
+
+By default the terminal shows the first check, every 30th check, hits and errors. With `-v` it shows every check.
+
+When nothing is bookable in the 2-month window, each logged check line also shows the **earliest bookable date** further out. For example:
+
+```
+[20:21:13] Check #1: nothing in the next 2 months | earliest bookable: Thu 25.02.2027 09:00 (in 100 days)
+```
+
+This is information only. You are notified only for slots inside the window. The look-ahead goes up to the site's booking horizon (about 9 months) and costs a few extra requests per logged check. If the site has nothing at all, the line says "no bookable slot at all up to the booking horizon".
 
 ## Notifications
 

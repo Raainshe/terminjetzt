@@ -189,6 +189,44 @@ def find_slots(service, settings, horizon_months=2):
     return sorted(found.values(), key=lambda s: s["start"])
 
 
+def find_earliest_beyond(service, settings, after_months=2):
+    """Earliest bookable slot after the notification window (info only, no alert).
+
+    Scans month by month up to the site's booking horizon (`appfuture` days) and
+    stops at the first month that has a bookable slot. Returns a slot or None.
+    """
+    now = berlin_now()
+    today = now.date()
+    limit = add_months(today, after_months)
+    horizon = today + dt.timedelta(days=int(settings.get("appfuture", 270) or 270))
+    cursor = add_months(today.replace(day=1), after_months)
+    while cursor <= horizon:
+        best = None
+        for slot in fetch_month(service, settings, cursor.isoformat()):
+            if int(slot.get("available", 0) or 0) <= 0:
+                continue
+            start = dt.datetime.fromisoformat(slot["start"])
+            if start.date() <= limit:
+                continue
+            if best is None or start < best:
+                best = start
+        if best is not None:
+            return {"start": best, "days": (best.date() - today).days}
+        cursor = add_months(cursor, 1)
+    return None
+
+
+def describe_earliest(service, settings, months):
+    """One-line text about the earliest bookable slot beyond the window."""
+    try:
+        e = find_earliest_beyond(service, settings, months)
+    except Exception as exc:  # info only; never break the main loop
+        return "earliest bookable date unknown (%s)" % exc
+    if e is None:
+        return "no bookable slot at all up to the booking horizon"
+    return "earliest bookable: %s (in %d days)" % (e["start"].strftime("%a %d.%m.%Y %H:%M"), e["days"])
+
+
 # --------------------------------------------------------------------------- #
 # Notifications
 # --------------------------------------------------------------------------- #
@@ -356,6 +394,7 @@ def main():
     p.add_argument("--months", type=int, default=2, help="look-ahead window in months (default 2)")
     p.add_argument("--open", action="store_true", help="also open the booking page in your browser on a hit")
     p.add_argument("--ntfy", metavar="TOPIC", help="also push to your phone via ntfy.sh topic")
+    p.add_argument("-v", "--verbose", action="store_true", help="print a line for every check")
     p.add_argument("--once", action="store_true", help="check once and exit")
     p.add_argument("--test", action="store_true", help="send a test notification and exit")
     p.add_argument("--list-services", action="store_true", help="list services and exit")
@@ -412,8 +451,9 @@ def main():
                 notified |= current
             elif slots:
                 log("Still available (already notified): %d slot(s)" % len(slots))
-            elif checks == 1 or checks % 30 == 0:
-                log("No appointments in the next %d months yet (check #%d)." % (args.months, checks))
+            elif args.verbose or checks == 1 or checks % 30 == 0:
+                log("Check #%d: nothing in the next %d months | %s" % (
+                    checks, args.months, describe_earliest(service, settings, args.months)))
         except (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError, OSError) as exc:
             failures += 1
             log("Check failed (%s). Retrying... [%d]" % (exc, failures))
