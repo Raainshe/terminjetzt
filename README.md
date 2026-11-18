@@ -4,7 +4,7 @@ python3 terminjetzt.py --interval 30 --ntfy terminryan --open
 
 # terminjetzt
 
-Watches the Stadt Heilbronn Ausländerbehörde booking page ([eTermin](https://www.etermin.net/qtermin-stadtheilbronn-abh?lang=en)) and notifies you when an appointment for the **residence permit extension** (*Verlängerung Aufenthaltserlaubnis*) opens up within the next 2 months.
+Watches the Stadt Heilbronn Ausländerbehörde booking page ([eTermin](https://www.etermin.net/qtermin-stadtheilbronn-abh?lang=en)) and notifies you when an appointment for the **residence permit extension** (*Verlängerung Aufenthaltserlaubnis*) opens up within the next 4 months.
 
 Leave it running on a Mac or Windows PC. It stays quiet until a bookable slot appears.
 
@@ -34,7 +34,7 @@ First run `python3 terminjetzt.py --test` to check that the pop-up, sound and co
 | --- | --- |
 | 🔴 Red | within 7 days |
 | 🟡 Yellow | within 30 days |
-| 🔵 Blue | within 2 months |
+| 🔵 Blue | within 4 months (the `--months` window) |
 
 The terminal output is coloured. Desktop and phone notifications use the matching emoji, and the title shows the soonest tier found.
 
@@ -45,7 +45,7 @@ The terminal output is coloured. Desktop and phone notifications use the matchin
 | `--interval N` | seconds between checks (default 60, minimum 20) |
 | `--ntfy TOPIC` | also push to your phone through [ntfy.sh](https://ntfy.sh) |
 | `--open` | open the booking page in your browser when a slot appears |
-| `--months N` | look-ahead window in months (default 2) |
+| `--months N` | look-ahead window in months (default 4) |
 | `--service ID` | watch a different service (default `144512`) |
 | `--list-services` | print all bookable services and their ids |
 | `-v`, `--verbose` | print a line for every check (by default only the first check, every 30th check, hits and errors are logged) |
@@ -56,8 +56,8 @@ The terminal output is coloured. Desktop and phone notifications use the matchin
 ## How it works
 
 1. **Reads the booking site's own data.** The page is a JavaScript app, so the script calls the same JSON API the page uses (`/api/timeslots`) instead of scraping HTML. It sends the header `webid: qtermin-stadtheilbronn-abh`.
-2. **Checks each month in the window.** For "next 2 months" it requests the current month and the next two months, as needed.
-3. **Keeps only bookable slots.** A slot counts only if `available > 0`. Slots that are full (`available: 0`), already in the past, or more than 2 months away are ignored.
+2. **Uses the page's "find free days" call.** The page first calls `/api/timeslots?...&rangesearch=1`. The server jumps to the first month with any availability and returns one entry per bookable day in it. The script repeats this month by month until it passes the window. This is the only call that reliably shows free days: the plain per-month call shows nothing for months that do have free days.
+3. **Keeps only days inside the window.** Days in the past or beyond `--months` (default 4) are ignored for notifications. The first bookable day the site offers is still logged, even if it is outside the window.
 4. **Assigns a tier** from the number of days until the slot: 7 or fewer is red, 30 or fewer is yellow, otherwise blue.
 5. **Notifies only on news.** You are alerted when a new slot appears. Slots you've already been told about don't repeat every check. If a slot disappears and comes back, you're alerted again.
 6. **Stays alive unattended.**
@@ -69,13 +69,13 @@ The terminal output is coloured. Desktop and phone notifications use the matchin
 
 By default the terminal shows the first check, every 30th check, hits and errors. With `-v` it shows every check.
 
-When nothing is bookable in the 2-month window, each logged check line also shows the **earliest bookable date** further out. For example:
+When nothing is bookable in the window, each logged check line also shows the **earliest bookable day** the site offers, even if it is outside the window. For example:
 
 ```
-[20:21:13] Check #1: nothing in the next 2 months | earliest bookable: Thu 25.02.2027 09:00 (in 100 days)
+[21:19:00] Check #1: nothing in the next 4 months | earliest bookable day: Wed 02.06.2027 (in 196 days)
 ```
 
-This is information only. You are notified only for slots inside the window. The look-ahead goes up to the site's booking horizon (about 9 months) and costs a few extra requests per logged check. If the site has nothing at all, the line says "no bookable slot at all up to the booking horizon".
+This is information only. You are notified only for days inside the window. If the site offers nothing at all, the line says "no bookable day offered at all right now". When you are notified, the exact times for each day are looked up and shown too.
 
 ## Notifications
 

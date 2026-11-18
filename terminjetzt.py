@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
 terminjetzt - watch the Heilbronn Ausländerbehörde booking page (eTermin) and
-notify you as soon as an appointment opens up in the next 2 months.
+notify you as soon as an appointment opens up in the next 4 months.
 
 Default service: "Verlängerung Aufenthaltserlaubnis" (residence permit extension).
 
 Tiers (by how soon the appointment is):
     RED     within 7 days
     YELLOW  within 30 days
-    BLUE    within 2 months
+    BLUE    within 4 months
 
 Only Python 3.8+ and the standard library are needed (macOS and Windows).
 
@@ -39,6 +39,7 @@ WEBID = "qtermin-stadtheilbronn-abh"
 BASE = "https://www.etermin.net"
 BOOKING_URL = BASE + "/" + WEBID + "?lang=en"
 DEFAULT_SERVICE_ID = 144512  # Verlängerung Aufenthaltserlaubnis
+DEFAULT_MONTHS = 4
 MIN_INTERVAL = 20  # seconds; be polite to the server
 
 SYSTEM = platform.system()  # "Darwin", "Windows", "Linux"
@@ -63,7 +64,7 @@ TIERS = {
     # name: (emoji for notifications, ANSI colour code, label)
     "red": ("\U0001F534", "1;91", "within 7 days"),
     "yellow": ("\U0001F7E1", "1;93", "within 30 days"),
-    "blue": ("\U0001F535", "1;94", "within 2 months"),
+    "blue": ("\U0001F535", "1;94", "within 4 months"),
 }
 
 
@@ -131,12 +132,12 @@ def load_settings():
     return data[0] if isinstance(data, list) else data
 
 
-def fetch_month(service, settings, date_str):
-    """Slots for the month containing `date_str` (the site does the same)."""
+def _timeslots_params(service, settings, date_str, rangesearch):
     tz = settings.get("timezone") or "W. Europe Standard Time"
-    params = {
-        "date": date_str,
-        "serviceid": service["sid"],
+    params = {"date": date_str, "serviceid": service["sid"]}
+    if rangesearch:
+        params["rangesearch"] = 1
+    params.update({
         "capacity": 1,
         "caching": "false",
         "duration": service.get("duration", 20),
@@ -146,85 +147,86 @@ def fetch_month(service, settings, date_str):
         "showavcap": "false",
         "appfuture": settings.get("appfuture", 270),
         "appdeadline": settings.get("appdeadline", 480),
-        "msdcm": settings.get("msdcm", 0),
-        "oneoff": "",
         "appdeadlinewm": settings.get("appdeadlinewm", 1),
-        "tz": tz,
-        "tzaccount": tz,
-        "calendarid": "",
-    }
-    return api_get("/api/timeslots", params)
+        "oneoff": "null",
+        "msdcm": settings.get("msdcm", 0),
+    })
+    if not rangesearch:
+        params["tz"] = tz
+        params["tzaccount"] = tz
+    params["calendarid"] = ""
+    return params
 
 
-def find_slots(service, settings, horizon_months=2):
-    """Return bookable slots in the next `horizon_months`, sorted by time."""
-    now = berlin_now()
-    today = now.date()
+def fetch_days(service, settings, date_str):
+    """Days with free capacity, starting at `date_str`.
+
+    This is the same `rangesearch=1` call the booking page makes first. The server
+    jumps to the first month (on/after `date_str`) that has any availability and
+    returns one entry per bookable day in it. An empty list means nothing is free.
+    """
+    return api_get("/api/timeslots", _timeslots_params(service, settings, date_str, True))
+
+
+def fetch_day_times(service, settings, day):
+    """Exact start times for one bookable day (the call the page makes when you click a day)."""
+    data = api_get("/api/timeslots", _timeslots_params(service, settings, day.isoformat(), False))
+    times = set()
+    for slot in data:
+        start = dt.datetime.fromisoformat(slot["start"])
+        if start.date() == day:
+            times.add(start.strftime("%H:%M"))
+    return sorted(times)
+
+
+def scan(service, settings, horizon_months):
+    """Find bookable days.
+
+    Returns (days_in_window, earliest_day). `days_in_window` are bookable days within
+    `horizon_months` (sorted list of dicts); `earliest_day` is the first bookable day
+    the site offers at all (may be beyond the window), or None.
+    """
+    today = berlin_now().date()
     limit = add_months(today, horizon_months)
-
-    # one request per calendar month that overlaps [today, limit]
-    months = []
-    cursor = today.replace(day=1)
-    while cursor <= limit:
-        months.append(cursor)
-        cursor = add_months(cursor, 1)
+    horizon = today + dt.timedelta(days=int(settings.get("appfuture", 270) or 270))
 
     found = {}
-    for i, first in enumerate(months):
-        # current month: use today's date (like the site); later months: the 1st
-        date_str = (today if i == 0 else first).isoformat()
-        for slot in fetch_month(service, settings, date_str):
-            if not slot.get("available", 0) or int(slot["available"]) <= 0:
-                continue  # full / not bookable
-            start = dt.datetime.fromisoformat(slot["start"])
-            if start <= now or start.date() > limit:
-                continue
-            key = (slot.get("calendarid"), slot["start"])
-            found[key] = {
-                "key": "%s|%s" % key,
-                "start": start,
-                "days": (start.date() - today).days,
-                "calendar": slot.get("calendarname", ""),
-            }
-    return sorted(found.values(), key=lambda s: s["start"])
+    earliest = None
+    cursor = today
+    for _ in range(14):  # safety cap; each pass jumps to the next month with availability
+        rows = fetch_days(service, settings, cursor.isoformat())
+        days = sorted({dt.datetime.fromisoformat(r["start"]).date()
+                       for r in rows if int(r.get("available", 0) or 0) > 0})
+        days = [d for d in days if d >= today]
+        if not days:
+            break
+        if earliest is None:
+            earliest = days[0]
+        for d in days:
+            if d <= limit:
+                found[d] = {"key": d.isoformat(), "date": d, "days": (d - today).days, "times": []}
+        last = days[-1]
+        nxt = add_months(last.replace(day=1), 1)
+        if days[0] > limit or nxt > limit or nxt > horizon:
+            break
+        cursor = nxt
+    return sorted(found.values(), key=lambda s: s["date"]), earliest
 
 
-def find_earliest_beyond(service, settings, after_months=2):
-    """Earliest bookable slot after the notification window (info only, no alert).
-
-    Scans month by month up to the site's booking horizon (`appfuture` days) and
-    stops at the first month that has a bookable slot. Returns a slot or None.
-    """
-    now = berlin_now()
-    today = now.date()
-    limit = add_months(today, after_months)
-    horizon = today + dt.timedelta(days=int(settings.get("appfuture", 270) or 270))
-    cursor = add_months(today.replace(day=1), after_months)
-    while cursor <= horizon:
-        best = None
-        for slot in fetch_month(service, settings, cursor.isoformat()):
-            if int(slot.get("available", 0) or 0) <= 0:
-                continue
-            start = dt.datetime.fromisoformat(slot["start"])
-            if start.date() <= limit:
-                continue
-            if best is None or start < best:
-                best = start
-        if best is not None:
-            return {"start": best, "days": (best.date() - today).days}
-        cursor = add_months(cursor, 1)
-    return None
+def add_times(service, settings, slots, max_days=15):
+    """Fill in exact times for the first few days (used when notifying)."""
+    for s in slots[:max_days]:
+        try:
+            s["times"] = fetch_day_times(service, settings, s["date"])
+        except Exception:
+            pass
 
 
-def describe_earliest(service, settings, months):
-    """One-line text about the earliest bookable slot beyond the window."""
-    try:
-        e = find_earliest_beyond(service, settings, months)
-    except Exception as exc:  # info only; never break the main loop
-        return "earliest bookable date unknown (%s)" % exc
-    if e is None:
-        return "no bookable slot at all up to the booking horizon"
-    return "earliest bookable: %s (in %d days)" % (e["start"].strftime("%a %d.%m.%Y %H:%M"), e["days"])
+def describe_earliest(earliest):
+    if earliest is None:
+        return "no bookable day offered at all right now"
+    return "earliest bookable day: %s (in %d days)" % (
+        earliest.strftime("%a %d.%m.%Y"), (earliest - berlin_now().date()).days)
 
 
 # --------------------------------------------------------------------------- #
@@ -315,7 +317,7 @@ def ntfy_notify(topic, title, message, priority="urgent"):
 
 
 def notify(new_slots, all_slots, args):
-    best = min(new_slots, key=lambda s: s["start"])
+    best = min(new_slots, key=lambda s: s["date"])
     tier = tier_for(best["days"])
     emoji = TIERS[tier][0]
     counts = {"red": 0, "yellow": 0, "blue": 0}
@@ -323,11 +325,10 @@ def notify(new_slots, all_slots, args):
         counts[tier_for(s["days"])] += 1
     summary = "  ".join("%s %d" % (TIERS[t][0], counts[t]) for t in ("red", "yellow", "blue") if counts[t])
     title = "%s Termin frei! (%s)" % (emoji, TIERS[tier][2])
-    msg = "Earliest: %s (in %d days). %s. Book now!" % (
-        best["start"].strftime("%a %d.%m.%Y %H:%M"),
-        best["days"],
-        summary,
-    )
+    when = best["date"].strftime("%a %d.%m.%Y")
+    if best.get("times"):
+        when += " " + ", ".join(best["times"][:4])
+    msg = "Earliest: %s (in %d days). %s. Book now!" % (when, best["days"], summary)
     desktop_notify(title, msg)
     play_sound()
     if args.ntfy:
@@ -366,16 +367,12 @@ def prevent_sleep():
 # Output
 # --------------------------------------------------------------------------- #
 def print_slots(slots):
-    by_day = {}
-    for s in slots:
-        by_day.setdefault(s["start"].date(), []).append(s)
-    for day, items in sorted(by_day.items()):
-        days = items[0]["days"]
-        tier = tier_for(days)
-        times = ", ".join(i["start"].strftime("%H:%M") for i in items[:12])
-        if len(items) > 12:
-            times += ", ... (+%d)" % (len(items) - 12)
-        line = "%s %s  in %2d days  %s" % (TIERS[tier][0], day.strftime("%a %d.%m.%Y"), days, times)
+    for sl in slots:
+        tier = tier_for(sl["days"])
+        times = ", ".join(sl["times"][:12])
+        if len(sl["times"]) > 12:
+            times += ", ... (+%d)" % (len(sl["times"]) - 12)
+        line = "%s %s  in %3d days  %s" % (TIERS[tier][0], sl["date"].strftime("%a %d.%m.%Y"), sl["days"], times)
         print("    " + paint(line, TIERS[tier][1]), flush=True)
 
 
@@ -391,7 +388,8 @@ def main():
     p.add_argument("--service", type=int, default=DEFAULT_SERVICE_ID,
                    help="service id (default %d = Verlängerung Aufenthaltserlaubnis)" % DEFAULT_SERVICE_ID)
     p.add_argument("--interval", type=int, default=60, help="seconds between checks (default 60, min %d)" % MIN_INTERVAL)
-    p.add_argument("--months", type=int, default=2, help="look-ahead window in months (default 2)")
+    p.add_argument("--months", type=int, default=DEFAULT_MONTHS,
+                   help="look-ahead window in months (default %d)" % DEFAULT_MONTHS)
     p.add_argument("--open", action="store_true", help="also open the booking page in your browser on a hit")
     p.add_argument("--ntfy", metavar="TOPIC", help="also push to your phone via ntfy.sh topic")
     p.add_argument("-v", "--verbose", action="store_true", help="print a line for every check")
@@ -401,9 +399,10 @@ def main():
     p.add_argument("--no-sleep-lock", action="store_true", help="do not prevent the computer from sleeping")
     args = p.parse_args()
     args.interval = max(args.interval, MIN_INTERVAL)
+    TIERS["blue"] = (TIERS["blue"][0], TIERS["blue"][1], "within %d months" % args.months)
 
     if args.test:
-        fake = [{"start": berlin_now() + dt.timedelta(days=5), "days": 5, "key": "t", "calendar": ""}]
+        fake = [{"date": berlin_now().date() + dt.timedelta(days=5), "days": 5, "key": "t", "times": ["09:50"]}]
         print("Sending test notification...")
         notify(fake, fake, args)
         time.sleep(3)
@@ -426,7 +425,7 @@ def main():
     log("Tiers: %s  %s  %s" % (
         paint("%s <=7 days" % TIERS["red"][0], TIERS["red"][1]),
         paint("%s <=30 days" % TIERS["yellow"][0], TIERS["yellow"][1]),
-        paint("%s <=2 months" % TIERS["blue"][0], TIERS["blue"][1]),
+        paint("%s <=%d months" % (TIERS["blue"][0], args.months), TIERS["blue"][1]),
     ))
     if not args.once and not args.no_sleep_lock and prevent_sleep():
         log("Sleep prevention on (computer stays awake while this runs).")
@@ -437,7 +436,7 @@ def main():
     checks = 0
     while True:
         try:
-            slots = find_slots(service, settings, args.months)
+            slots, earliest = scan(service, settings, args.months)
             failures = 0
             checks += 1
             current = {s["key"] for s in slots}
@@ -445,15 +444,16 @@ def main():
             new = [s for s in slots if s["key"] not in notified]
 
             if new:
-                log(paint("APPOINTMENT AVAILABLE! %d slot(s):" % len(slots), "1;97"))
+                add_times(service, settings, slots)
+                log(paint("APPOINTMENT AVAILABLE! %d day(s):" % len(slots), "1;97"))
                 print_slots(slots)
                 notify(new, slots, args)
                 notified |= current
             elif slots:
-                log("Still available (already notified): %d slot(s)" % len(slots))
+                log("Still available (already notified): %d day(s)" % len(slots))
             elif args.verbose or checks == 1 or checks % 30 == 0:
                 log("Check #%d: nothing in the next %d months | %s" % (
-                    checks, args.months, describe_earliest(service, settings, args.months)))
+                    checks, args.months, describe_earliest(earliest)))
         except (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError, OSError) as exc:
             failures += 1
             log("Check failed (%s). Retrying... [%d]" % (exc, failures))
